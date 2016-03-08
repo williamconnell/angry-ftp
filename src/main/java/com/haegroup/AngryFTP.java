@@ -11,7 +11,7 @@ public class AngryFTP
 {
     public static void main(String[] args)
     {
-        FTPServer server = new FTPServer();
+        FTPServer server = new FTPServer("D:/watch");
 
         try
         {

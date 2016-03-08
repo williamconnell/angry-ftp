@@ -2,48 +2,56 @@ package com.haegroup.net;
 
 import org.apache.commons.lang3.ArrayUtils;
 
-import java.io.*;
-import java.net.*;
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.time.LocalDateTime;
-import java.time.ZoneOffset;
-import java.time.format.DateTimeFormatter;
-import java.util.Arrays;
+import java.security.KeyStore;
 
 /**
  * Created by William Connell on 29/01/2016.
  */
 public class FTPClientConnection
 {
-    private final Socket commandClient;
-    private ServerSocket passiveSocket;
-    private String dataClientAddress;
-    private int dataClientPort;
+    private final Socket originalSocket;
+    private Socket socket;
+    private FTPDataConnection dataConnection;
 
-    private boolean isPassive = false;
-
-    private final InputStream commandInputStream;
-    private final OutputStream commandOutputStream;
+    private InputStream commandInputStream;
+    private OutputStream commandOutputStream;
 
     private String username;
 
-    private final String rootPath;
+    private String rootPath;
     private String currentPath;
 
-    public FTPClientConnection(Socket commandClient) throws IOException
-    {
-        this.commandClient = commandClient;
+    private char transferCode;
 
-        this.commandInputStream = commandClient.getInputStream();
-        this.commandOutputStream = commandClient.getOutputStream();
+    public FTPClientConnection(Socket socket, String anonymousDirectory) throws IOException
+    {
+        this.originalSocket = socket;
+        this.socket = this.originalSocket;
+
+        this.commandInputStream = socket.getInputStream();
+        this.commandOutputStream = socket.getOutputStream();
 
         // Store the paths.
-        this.rootPath = new File(".").getCanonicalPath().replace('\\', '/');
+        this.rootPath = anonymousDirectory;// new File(".").getCanonicalPath().replace('\\', '/');
         this.currentPath = "/";
+
+        this.dataConnection = null;
     }
 
     public void handle(Object object) throws Exception
@@ -80,6 +88,10 @@ public class FTPClientConnection
                 // Handle the command.
                 switch (command)
                 {
+                    case "AUTH":
+                        response = auth(arguments);
+                        break;
+
                     case "USER":
                         response = user(arguments);
                         break;
@@ -117,6 +129,10 @@ public class FTPClientConnection
 
                         break;
 
+                    case "DELE":
+                        response = delete(arguments);
+                        break;
+
                     case "PORT":
                         response = port(arguments);
                         break;
@@ -137,12 +153,20 @@ public class FTPClientConnection
                         response = list(arguments);
                         break;
 
+                    case "RETR":
+                        response = retrieve(arguments);
+                        break;
+
+                    case "STOR":
+                        response = store(arguments);
+                        break;
+
                     default:
                         response = "502 Command not implemented.";
                         break;
                 }
 
-                if (commandClient == null || !commandClient.isConnected())
+                if (socket == null || !socket.isConnected())
                 {
                     break;
                 }
@@ -155,6 +179,48 @@ public class FTPClientConnection
                     {
                         break;
                     }
+
+                    if (command.equals("AUTH"))
+                    {
+                        InputStream stream = null;
+                        try
+                        {
+                            stream = FTPClientConnection.class.getResource("/server.pfx").openStream();
+
+                            final SSLContext sslContext = SSLContext.getInstance("TLS");
+
+                            final KeyStore keyStore = KeyStore.getInstance("PKCS12");
+                            keyStore.load(stream, "password".toCharArray());
+
+                            final KeyManagerFactory keyManagerFactory = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+                            keyManagerFactory.init(keyStore, "password".toCharArray());
+
+                            sslContext.init(keyManagerFactory.getKeyManagers(), null, null);
+
+                            SSLSocketFactory sslSocketFactory = sslContext.getSocketFactory();
+
+                            // Override the socket.
+                            SSLSocket sslSocket = (SSLSocket) sslSocketFactory.createSocket(
+                                    originalSocket,
+                                    null,
+                                    originalSocket.getPort(),
+                                    false);
+                            sslSocket.setUseClientMode(false);
+
+                            socket = sslSocket;
+
+                            // Store the new streams.
+                            commandInputStream = socket.getInputStream();
+                            commandOutputStream = socket.getOutputStream();
+                        }
+                        finally
+                        {
+                            if (stream != null)
+                            {
+                                stream.close();
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -163,6 +229,90 @@ public class FTPClientConnection
             e.printStackTrace();
             throw e;
         }
+    }
+
+    private String auth(String mode)
+    {
+        switch (mode)
+        {
+            case "TLS":
+                return "234 Enabling TLS Connection.";
+
+            default:
+                return "504 Unrecognised AUTH mode.";
+        }
+    }
+
+    private String delete(String filename) throws IOException
+    {
+        final String absoluteFilename = rootPath + changeDirectory(currentPath, filename);
+
+        if (!Files.exists(Paths.get(absoluteFilename)))
+        {
+            return "505 File does not exist.";
+        }
+
+        Files.delete(Paths.get(absoluteFilename));
+
+        return "250 Requested file action okay, completed.";
+    }
+
+    private String store(String filename) throws IOException
+    {
+        final String absoluteFilename = rootPath + changeDirectory(currentPath, filename);
+        final String absoluteFilepath = absoluteFilename.substring(0, absoluteFilename.lastIndexOf('/'));
+
+        if (!Files.exists(Paths.get(absoluteFilepath)))
+        {
+            return "505 Path does not exist.";
+        }
+
+        final File file = new File(absoluteFilename);
+        if (!dataConnection.store(file, param -> {
+            try
+            {
+                writeLine("226 Closing data connection, file transfer successful.");
+            }
+            catch (IOException e)
+            {
+                return false;
+            }
+            return true;
+        }))
+        {
+            return "505 File not found.";
+        }
+
+        return "150 File status okay; about to open data connection.";
+    }
+
+    private String retrieve(String filename) throws IOException
+    {
+        if (filename == null)
+        {
+            return "505 File not found.";
+        }
+
+        // Sanitise the filename
+        filename = filename.replace('\\', '/');
+        Path path = Paths.get(rootPath, currentPath, filename);
+
+        if (dataConnection.retrieve(path, param -> {
+            try
+            {
+                writeLine("226 Closing data connection, file transfer successful.");
+            }
+            catch (IOException e)
+            {
+                return false;
+            }
+            return true;
+        }, transferCode))
+        {
+            return String.format("150 Opening %s mode data transfer for RETR", dataConnection.isPassive() ? "PASSIVE" : "ACTIVE");
+        }
+
+        return "505 File not found.";
     }
 
     private String readLine() throws IOException
@@ -209,7 +359,7 @@ public class FTPClientConnection
 
     private String changeWorkingDirectory(String path)
     {
-        String newPath = concatDirectory(currentPath, path);
+        String newPath = changeDirectory(currentPath, path);
 
         // Verify the path is valid.
         if (!Files.isDirectory(Paths.get(rootPath, newPath)))
@@ -230,8 +380,10 @@ public class FTPClientConnection
         {
             case "A":
             case "I":
+                transferCode = typeCode.charAt(0);
                 response = "200 OK";
                 break;
+
             case "E":
             case "L":
             default:
@@ -270,11 +422,15 @@ public class FTPClientConnection
         // Skip 0 as that will be empty.
         String address = String.format("%s.%s.%s.%s", args);
 
+        int high = Integer.parseInt(args[4]);
+        int low = Integer.parseInt(args[5]);
+
         // Wrap the ByteBuffer.
-        ByteBuffer bb = ByteBuffer.wrap(new byte[]{Byte.parseByte(args[4]), Byte.parseByte(args[5])});
+        ByteBuffer bb = ByteBuffer.wrap(new byte[] {(byte)(high & 0xFF), (byte)(low & 0xFF)});
         bb.order(ByteOrder.BIG_ENDIAN);
 
-        int port = bb.getInt();
+        int port = bb.getShort() & 0xFFFF;
+        System.out.println("PORT: " + port);
 
         return extendedPort(String.format("|%d|%s|%d|", 1, address, port));
     }
@@ -285,7 +441,7 @@ public class FTPClientConnection
 
         String[] split = result.split("\\|", 2);
 
-        String address = split[0].replace('.', ',').replace("/", "");
+        String address = split[0].replace('.', ',');
         int port = Integer.parseInt(split[1]);
 
         ByteBuffer bb = ByteBuffer.allocate(2);
@@ -296,75 +452,38 @@ public class FTPClientConnection
         byte[] portBytes = new byte[2];
         bb.get(portBytes);
 
-        return String.format("227 Entering Passive Mode (%s,%d,%d)", address, portBytes[0], portBytes[1]);
+        return String.format("227 Entering Passive Mode (%s,%d,%d)", address, (short) portBytes[0] & 0xFF, (short) portBytes[1] & 0xFF);
     }
 
     private String list(String pathname) throws IOException
     {
-        final DateTimeFormatter format1 = DateTimeFormatter.ofPattern("MMM dd  yyyy");
-        final DateTimeFormatter format2 = DateTimeFormatter.ofPattern("MMM dd HH:mm");
-
         if (pathname == null)
         {
             pathname = "/";
         }
 
-        // Remove any windows slashes.
-        pathname = pathname.replace('\\', '/');
-        Path path = Paths.get(rootPath, currentPath, pathname);
+        // Write the list via the data connection.
+        boolean result = dataConnection.list(rootPath, currentPath, pathname, param -> {
+            try
+            {
+                writeLine("266 Transfer complete.");
+            }
+            catch (IOException e)
+            {
+                return false;
+            }
 
-        if (Files.exists(path) && Files.isDirectory(path))
+            return true;
+        });
+
+        if (result)
         {
-            final Socket dataClient;
-            if (isPassive)
-            {
-                dataClient = passiveSocket.accept();
-            }
-            else
-            {
-                dataClient = new Socket(dataClientAddress, dataClientPort);
-            }
-
-            if (dataClient.isConnected())
-            {
-                new Thread(() -> {
-                    try
-                    {
-                        final OutputStream dataOutputStream = dataClient.getOutputStream();
-
-                        // List all of the files in the directory.
-                        File[] files = path.toFile().listFiles();
-                        for (File file : files)
-                        {
-                            String descriptor = file.isDirectory() ? "drwxr-xr-x" : "-rwxr-xr-x";
-
-                            LocalDateTime lastModified = LocalDateTime.ofEpochSecond(file.lastModified(), 0, ZoneOffset.UTC);
-
-                            String date = lastModified.compareTo(LocalDateTime.now().minusDays(180)) < 0 ?
-                                    lastModified.format(format1) : lastModified.format(format2);
-
-                            String line = String.format("%s   1 %-10s %-10s %10d %s %s", descriptor, "temp", "temp", file.length(), date, file.getName());
-                            writeLine(dataOutputStream, line);
-                        }
-
-                        if (isPassive)
-                        {
-                            dataClient.close();
-                        }
-
-                        writeLine("266 Transfer complete.");
-                    }
-                    catch (IOException e)
-                    {
-                        e.printStackTrace();
-                    }
-                }, "TEMP THREAD").start();
-            }
-
-            return String.format("150 Opening %s mode data transfer for LIST.", isPassive ? "PASSIVE" : "ACTIVE");
+            return String.format("150 Opening %s mode data transfer for LIST.", dataConnection.isPassive() ? "PASSIVE" : "ACTIVE");
         }
-
-        return "450 Requested file action not taken.";
+        else
+        {
+            return "450 Requested file action not taken.";
+        }
     }
 
     private String extendedPort(String arguments) throws IOException
@@ -390,10 +509,7 @@ public class FTPClientConnection
             return "501 Syntax error in parameters or arguments, port is out of valid range (0 .. " + Short.MAX_VALUE + ").";
         }
 
-        dataClientAddress = address;
-        dataClientPort = port;
-
-        isPassive = false;
+        dataConnection = new FTPDataConnection(address, port);
 
         return "200 OK.";
     }
@@ -422,29 +538,27 @@ public class FTPClientConnection
 
     private String startPassive(int port) throws IOException
     {
-//        InetAddress address = commandClient.getInetAddress();
+        ServerSocket passiveListener = null;
 
-        if (passiveSocket != null)
+        int localPort = -1;
+        while (localPort < 1 || localPort > 32767)
         {
-            try
+            if (passiveListener != null)
             {
-                passiveSocket.close();
+                passiveListener.close();
             }
-            catch (IOException ignored) { }
+
+            passiveListener = new ServerSocket(port, 16, socket.getLocalAddress());
+            localPort = passiveListener.getLocalPort();
         }
 
-        // Open a passive listener.
-        passiveSocket = new ServerSocket(port);
+        dataConnection = new FTPDataConnection(passiveListener);
 
-        InetAddress localSocketAddress = commandClient.getInetAddress();
-        int localPort = passiveSocket.getLocalPort();
-
-        isPassive = true;
-
-        return localSocketAddress.toString() + '|' + localPort;
+        final InetAddress localAddress = passiveListener.getInetAddress();
+        return localAddress.getHostAddress() + '|' + localPort;
     }
 
-    private static String concatDirectory(String currentPath, String path)
+    private static String changeDirectory(String currentPath, String path)
     {
         String[] parts = path.split("/");
 

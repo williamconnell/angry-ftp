@@ -1,43 +1,38 @@
 package com.haegroup.net;
 
-import java.io.*;
+import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Created by william.connell on 29/01/2016.
+ * Created by William Connell on 29/01/2016.
  */
 public class FTPServer
 {
-    public static final int DEFAULT_COMMAND_PORT = 21;
-    public static final int DEFAULT_DATA_PORT = 20;
+    private static final int DEFAULT_COMMAND_PORT = 21;
 
-    public static final String LINE_END = "\r\n";
+    static final String LINE_END = "\r\n";
 
     private ServerSocket listenSocket;
+
     private int commandPort;
-    private int dataPort;
 
     private final ExecutorService executorService;
+    private final String anonymousDirectory;
 
-    public FTPServer()
+    public FTPServer(String anonymousDirectory)
     {
-        this(DEFAULT_COMMAND_PORT);
+        this(DEFAULT_COMMAND_PORT, anonymousDirectory);
     }
 
-    public FTPServer(int commandPort)
-    {
-        this(commandPort, DEFAULT_DATA_PORT);
-    }
-
-    public FTPServer(int commandPort, int dataPort)
+    public FTPServer(int commandPort, String anonymousDirectory)
     {
         this.commandPort = commandPort;
-        this.dataPort = dataPort;
 
         this.executorService = Executors.newFixedThreadPool(256);
+        this.anonymousDirectory = anonymousDirectory;
     }
 
     public void start() throws IOException
@@ -60,18 +55,21 @@ public class FTPServer
         }
     }
 
+    /**
+     * Accept new client connections.
+     */
     private void acceptClients()
     {
         while (!listenSocket.isClosed())
         {
-            Socket client = null;
+            Socket client;
 
             try
             {
                 client = listenSocket.accept();
 
                 // Hand off to the thread pool.
-                final FTPClientConnection connection = new FTPClientConnection(client);
+                final FTPClientConnection connection = new FTPClientConnection(client, anonymousDirectory);
                 executorService.submit((Runnable) () -> {
                     try
                     {
